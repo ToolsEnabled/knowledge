@@ -2,14 +2,18 @@
 """Generic project-brief MCP. Python 3.11+, Git; no third-party dependencies."""
 from __future__ import annotations
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import os
+if os.name == 'nt':
+    import msvcrt
+else:
+    import fcntl
 from pathlib import Path
 import re
 import shutil
@@ -39,7 +43,7 @@ class KnowledgeError(Exception):
 
 
 def guard(interior='refuse', environ=None, proc=Path('/proc'), start_pid=None):
-    """Inspect marker names/comm only; never ancestor environments or argv."""
+    """Inspect current marker names and ancestor process names, never argv/env."""
     if interior not in ('refuse', 'allow'):
         raise KnowledgeError('CONFIG_INVALID', 'interior must be refuse or allow')
     if interior == 'allow':
@@ -48,6 +52,14 @@ def guard(interior='refuse', environ=None, proc=Path('/proc'), start_pid=None):
     if any(env.get(key) not in (None, '', '0', 'false') for key in MARKERS):
         raise KnowledgeError('INTERIOR_WORKER_REFUSED', 'Fleet worker marker present')
     pid, visited = start_pid or os.getppid(), set()
+    if os.name == 'nt':
+        try:
+            names = _windows_parent_names(pid)
+        except Exception:
+            raise KnowledgeError('INTERIOR_IDENTITY_UNKNOWN', 'Cannot verify owner process ancestry')
+        if any(re.search(r'fleet|openshell|open-shell', name) for name in names):
+            raise KnowledgeError('INTERIOR_WORKER_REFUSED', 'Fleet process ancestor present')
+        return
     while pid > 1 and pid not in visited:
         visited.add(pid)
         try:
@@ -60,20 +72,56 @@ def guard(interior='refuse', environ=None, proc=Path('/proc'), start_pid=None):
         pid = int(stat[stat.rfind(')') + 2:].split()[1])
 
 
+def _windows_parent_names(start_pid, run=subprocess.run, system_root=None):
+    """Read native Windows parent image names; failure remains unknown/fail-closed."""
+    if type(start_pid) is not int or start_pid < 1:
+        raise OSError('Windows process identity is invalid')
+    root = os.environ.get('SystemRoot') if system_root is None else system_root
+    if not isinstance(root, str) or not root:
+        raise OSError('Windows system root is unavailable')
+    powershell = Path(root) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'
+    if not powershell.is_absolute() or not powershell.is_file():
+        raise OSError('Trusted Windows PowerShell is unavailable')
+    # PowerShell 5.1 treats all remaining tokens after -Command as command text,
+    # rather than populating $args. Embed only the already-converted integer PID
+    # in encoded PowerShell so the query receives the exact starting identity.
+    script = (r'''$ErrorActionPreference='Stop'; $id=[int]PID_VALUE; $startingPid=$id; Start-Sleep -Milliseconds 300; $seen=New-Object 'System.Collections.Generic.HashSet[int]'; $names=New-Object 'System.Collections.Generic.List[string]'; $processes=Get-CimInstance -ClassName Win32_Process -ErrorAction Stop; $byId=@{}; foreach($item in $processes){ $byId[[int]$item.ProcessId]=$item }; if(-not $byId.ContainsKey($id)){ throw 'Starting process identity unavailable' }; $startingName=[IO.Path]::GetFileNameWithoutExtension([string]$byId[$id].Name).ToLowerInvariant(); while($id -gt 1 -and $id -ne 4){ if(-not $seen.Add($id)){ throw 'Process parent cycle' }; if(-not $byId.ContainsKey($id)){ throw 'Process identity unavailable' }; $p=$byId[$id]; $name=[IO.Path]::GetFileNameWithoutExtension([string]$p.Name).ToLowerInvariant(); $names.Add($name); if($name -eq 'wininit'){ break }; $id=[int]$p.ParentProcessId }; ConvertTo-Json -Compress -InputObject @{startingPid=$startingPid;startingName=$startingName;names=@($names.ToArray())}'''
+              .replace('PID_VALUE', str(int(start_pid))))
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    result = run([str(powershell), '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                 capture_output=True, text=True, timeout=8, check=False)
+    if result.returncode != 0:
+        raise OSError('Windows process ancestry query failed')
+    value = json.loads(result.stdout)
+    if (not isinstance(value, dict) or type(value.get('startingPid')) is not int
+            or value.get('startingPid') != start_pid
+            or not isinstance(value.get('startingName'), str) or not value['startingName']
+            or not isinstance(value.get('names'), list) or not value['names']
+            or any(not isinstance(name, str) or not name for name in value['names'])
+            or value['names'][0] != value['startingName']):
+        raise OSError('Windows process ancestry response was invalid')
+    return value['names']
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
 
 def git(repo, *args, timeout=5, env_extra=None, data=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-    env.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
+    env.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
                GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1',
                # Fetch never adds refs/remotes/origin/HEAD (Git 2.48+ default), so refs change only when data changes.
                GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='remote.origin.followRemoteHEAD', GIT_CONFIG_VALUE_0='never')
     env.update(env_extra or {})
-    command = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=',
-               '-c', 'core.fsmonitor=false', '-c', 'commit.gpgsign=false',
-               '-c', 'maintenance.auto=false', '-c', 'gc.auto=0']
+    command = ['git']
+    if os.name == 'nt':
+        # Keep Git's ordinary Windows CRLF worktree normalization even though
+        # user/global config is intentionally isolated from Knowledge operations.
+        command += ['-c', 'core.autocrlf=true']
+    command += ['-c', f'core.hooksPath={os.devnull}', '-c', 'credential.helper=',
+                '-c', 'core.fsmonitor=false', '-c', 'commit.gpgsign=false',
+                '-c', 'maintenance.auto=false', '-c', 'gc.auto=0']
     if repo is not None:
         command += ['-C', str(repo)]
     command += list(args)
@@ -471,27 +519,53 @@ class Knowledge:
 
     @contextmanager
     def repo_lock(self, wait=0):
-        """Exclusive use of the clone across threads and processes. Waits up to `wait` seconds for a sync or
-        update that another process sharing this clone is running, instead of failing at once."""
-        deadline = time.monotonic()+max(0, wait)
+        """Exclusive clone lock with bounded waiting and native Windows/POSIX byte locks."""
+        deadline = time.monotonic() + max(0, wait)
         acquired = self._operation_lock.acquire(timeout=wait) if wait > 0 else self._operation_lock.acquire(blocking=False)
         if not acquired:
             raise KnowledgeError('REPO_BUSY', 'Another sync or update in this process is still running; retry')
         handle = None
+        locked = False
         try:
             directory = git(self.config.repo, 'rev-parse', '--absolute-git-dir', timeout=self.config.timeout).decode().strip()
             handle = open(Path(directory)/'knowledge.lock', 'a+b')
-            while True:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise KnowledgeError('REPO_BUSY', 'Another knowledge process held the repository for the whole wait; retry')
-                    time.sleep(0.05)
+            if os.name == 'nt':
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b'\0')
+                    handle.flush()
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        locked = True
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise KnowledgeError('REPO_BUSY', 'Another knowledge process held the repository for the whole wait; retry')
+                        time.sleep(0.05)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        locked = True
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise KnowledgeError('REPO_BUSY', 'Another knowledge process held the repository for the whole wait; retry')
+                        time.sleep(0.05)
             yield
         finally:
             if handle:
+                if locked:
+                    if os.name == 'nt':
+                        try:
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        except OSError:
+                            pass
+                    else:
+                        fcntl.flock(handle, fcntl.LOCK_UN)
                 handle.close()
             self._operation_lock.release()
 
